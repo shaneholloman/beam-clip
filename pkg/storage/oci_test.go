@@ -183,6 +183,30 @@ func (m *blockingCountingLayer) Calls() int {
 	return m.calls
 }
 
+type barrierCountingLayer struct {
+	*mockLayer
+	mu      sync.Mutex
+	started chan struct{}
+	release chan struct{}
+	calls   int
+}
+
+func (m *barrierCountingLayer) Compressed() (io.ReadCloser, error) {
+	m.mu.Lock()
+	m.calls++
+	m.mu.Unlock()
+
+	m.started <- struct{}{}
+	<-m.release
+	return m.mockLayer.Compressed()
+}
+
+func (m *barrierCountingLayer) Calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
 // Helper to create gzip-compressed test data
 func createGzipData(t *testing.T, data []byte) []byte {
 	var buf bytes.Buffer
@@ -895,6 +919,63 @@ func TestOCIStorage_GlobalLayerDecompressionSingleflightAcrossInstances(t *testi
 	require.Equal(t, 1, layer.Calls(), "only one storage instance should decompress a shared layer")
 
 	got, err := os.ReadFile(filepath.Join(diskCacheDir, decompressedHash))
+	require.NoError(t, err)
+	require.Equal(t, testData, got)
+}
+
+func TestOCIStorage_ConcurrentDirectDecompressionUsesUniqueTempFiles(t *testing.T) {
+	testData := []byte("shared layer materialization from separate worker processes")
+	compressedData := createGzipData(t, testData)
+
+	digest := v1.Hash{
+		Algorithm: "sha256",
+		Hex:       "direct-concurrent-layer",
+	}
+	sum := sha256.Sum256(testData)
+	decompressedHash := hex.EncodeToString(sum[:])
+	diskCacheDir := t.TempDir()
+	diskPath := filepath.Join(diskCacheDir, decompressedHash)
+
+	metadata := &common.ClipArchiveMetadata{
+		StorageInfo: &common.OCIStorageInfo{
+			DecompressedHashByLayer: map[string]string{
+				digest.String(): decompressedHash,
+			},
+		},
+	}
+	storageInfo := metadata.StorageInfo.(*common.OCIStorageInfo)
+	layer := &barrierCountingLayer{
+		mockLayer: &mockLayer{digest: digest, compressedData: compressedData},
+		started:   make(chan struct{}, 2),
+		release:   make(chan struct{}),
+	}
+
+	storage1 := &OCIClipStorage{
+		metadata:     metadata,
+		storageInfo:  storageInfo,
+		layerCache:   map[string]v1.Layer{digest.String(): layer},
+		diskCacheDir: diskCacheDir,
+	}
+	storage2 := &OCIClipStorage{
+		metadata:     metadata,
+		storageInfo:  storageInfo,
+		layerCache:   map[string]v1.Layer{digest.String(): layer},
+		diskCacheDir: diskCacheDir,
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- storage1.decompressAndCacheLayer(digest.String(), diskPath) }()
+	go func() { errs <- storage2.decompressAndCacheLayer(digest.String(), diskPath) }()
+
+	<-layer.started
+	<-layer.started
+	close(layer.release)
+
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+	require.Equal(t, 2, layer.Calls())
+
+	got, err := os.ReadFile(diskPath)
 	require.NoError(t, err)
 	require.Equal(t, testData, got)
 }

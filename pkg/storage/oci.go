@@ -679,13 +679,15 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 	}
 	defer compressedRC.Close()
 
-	// Create temp file for atomic write
-	tempPath := diskPath + ".tmp"
-	tempFile, err := os.Create(tempPath)
+	// Create a unique same-directory temp file. Multiple worker processes can
+	// share the same disk cache directory, so a deterministic "<hash>.tmp" name
+	// can race even though each process has its own singleflight.
+	tempFile, err := os.CreateTemp(filepath.Dir(diskPath), filepath.Base(diskPath)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temp cache file: %w", err)
 	}
-	defer os.Remove(tempPath) // Clean up on error
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath) // Clean up on error or if another process wins.
 
 	// Decompress directly to disk (streaming)
 	gzr, err := gzip.NewReader(compressedRC)
@@ -702,8 +704,16 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 		return fmt.Errorf("failed to decompress layer to disk: %w", err)
 	}
 
-	// Atomic rename
+	if _, err := os.Stat(diskPath); err == nil {
+		return nil
+	}
+
+	// Atomic rename. If another worker materialized the same immutable layer
+	// between our final stat and rename, treat that as success.
 	if err := os.Rename(tempPath, diskPath); err != nil {
+		if _, statErr := os.Stat(diskPath); statErr == nil {
+			return nil
+		}
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
