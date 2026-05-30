@@ -653,7 +653,7 @@ func TestOCIStorage_CacheError(t *testing.T) {
 	assert.Equal(t, testData, dest)
 }
 
-func TestOCIStorage_ContentCacheUnavailableDoesNotFetchLayer(t *testing.T) {
+func TestOCIStorage_ContentCacheUnavailableFallsBackToLayerFetch(t *testing.T) {
 	testData := []byte("Hello, World! This is test data for OCI storage.")
 	compressedData := createGzipData(t, testData)
 	digest := v1.Hash{
@@ -700,10 +700,11 @@ func TestOCIStorage_ContentCacheUnavailableDoesNotFetchLayer(t *testing.T) {
 	dest := make([]byte, len(testData))
 	n, err := storage.ReadFile(node, dest, 0)
 
-	require.ErrorIs(t, err, ErrContentCacheUnavailable)
-	require.Zero(t, n)
+	require.NoError(t, err)
+	require.Equal(t, len(testData), n)
+	require.Equal(t, testData, dest)
 	_, statErr := os.Stat(storage.getDecompressedCachePath(decompressedHash))
-	require.True(t, os.IsNotExist(statErr))
+	require.NoError(t, statErr)
 }
 
 func TestOCIStorage_LayerFetchError(t *testing.T) {

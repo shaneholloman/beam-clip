@@ -421,7 +421,11 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Str("decompressed_hash", decompressedHash).
 				Msg("content cache range read failed")
 			if errors.Is(err, ErrContentCacheUnavailable) {
-				return 0, err
+				log.Warn().
+					Err(err).
+					Str("layer_digest", remote.LayerDigest).
+					Str("decompressed_hash", decompressedHash).
+					Msg("content cache unavailable - falling back to OCI for correctness")
 			}
 			log.Debug().
 				Str("layer_digest", remote.LayerDigest).
