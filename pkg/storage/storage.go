@@ -48,6 +48,7 @@ type ClientLocalFileView struct {
 	Source           string
 	LayerDigest      string
 	DecompressedHash string
+	Attrs            map[string]string
 }
 
 type ClipStorageInterface interface {

@@ -356,6 +356,11 @@ func (n *FSNode) maybeWarmLegacyContentCache() {
 func (n *FSNode) clientLocalFileViewReadTrace(view storage.ClientLocalFileView, off int64, readLen int64, bytesRead int64, started time.Time, err error) common.ReadTraceEvent {
 	operation := "clip.read"
 	attrs := map[string]string{}
+	for key, value := range view.Attrs {
+		if key != "" && value != "" {
+			attrs[key] = value
+		}
+	}
 	if n != nil && n.clipNode != nil && n.clipNode.Remote != nil {
 		operation = "clip.oci_read"
 		attrs["storage_mode"] = "oci"

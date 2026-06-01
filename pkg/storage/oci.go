@@ -35,6 +35,8 @@ type OCIClipStorage struct {
 	useCheckpoints        bool                              // Enable checkpoint-based partial decompression
 	readTraceObserver     common.ReadTraceObserver
 	mu                    sync.RWMutex
+	contentCacheWarmMu    sync.Mutex
+	contentCacheWarmOnce  map[string]struct{}
 }
 
 var globalLayerDecompress = newLayerDecompressGroup()
@@ -125,6 +127,7 @@ func NewOCIClipStorage(opts OCIClipStorageOpts) (*OCIClipStorage, error) {
 		contentCacheAvailable: opts.ContentCacheAvailable,
 		useCheckpoints:        opts.UseCheckpoints,
 		readTraceObserver:     opts.ReadTraceObserver,
+		contentCacheWarmOnce:  make(map[string]struct{}),
 	}
 
 	log.Info().
@@ -272,7 +275,7 @@ func (s *OCIClipStorage) ClientLocalFileView(ctx context.Context, node *common.C
 
 	layerPath := s.getDecompressedCachePath(decompressedHash)
 	if _, err := os.Stat(layerPath); err == nil {
-		s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
+		warmDecision := s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, layerPath)
 		return ClientLocalFileView{
 			Path:             layerPath,
 			Offset:           wantUStart,
@@ -280,6 +283,13 @@ func (s *OCIClipStorage) ClientLocalFileView(ctx context.Context, node *common.C
 			Source:           "disk_cache_fd",
 			LayerDigest:      remote.LayerDigest,
 			DecompressedHash: decompressedHash,
+			Attrs: map[string]string{
+				"cache_result":            "hit",
+				"cache_tier":              "local_decompressed_layer",
+				"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
+				"content_cache_warm":      warmDecision,
+				"storage_mode":            "oci",
+			},
 		}, true, nil
 	} else if !os.IsNotExist(err) {
 		return ClientLocalFileView{}, false, err
@@ -306,6 +316,12 @@ func (s *OCIClipStorage) ClientLocalFileView(ctx context.Context, node *common.C
 		Source:           "client_local_page_file_fd",
 		LayerDigest:      remote.LayerDigest,
 		DecompressedHash: decompressedHash,
+		Attrs: map[string]string{
+			"cache_result":            "hit",
+			"cache_tier":              "embedded_page_file",
+			"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
+			"storage_mode":            "oci",
+		},
 	}, true, nil
 }
 
@@ -317,6 +333,10 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 	remote := node.Remote
 	readStart := time.Now()
 	readSource := "unknown"
+	readAttrs := map[string]string{
+		"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
+		"storage_mode":            "oci",
+	}
 
 	// Calculate read range in uncompressed layer space
 	wantUStart := remote.UOffset + offset
@@ -347,10 +367,7 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 			Duration:         time.Since(readStart),
 			Success:          err == nil,
 			Error:            errorString(err),
-			Attrs: map[string]string{
-				"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
-				"storage_mode":            "oci",
-			},
+			Attrs:            readAttrs,
 		})
 	}()
 
@@ -367,9 +384,12 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Int64("offset", wantUStart).
 				Int64("length", readLen).
 				Msg("disk cache hit - using local decompressed layer")
-			s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
+			warmDecision := s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, layerPath)
 			metrics.RecordReadHit()
 			readSource = "disk_cache"
+			readAttrs["cache_result"] = "hit"
+			readAttrs["cache_tier"] = "local_decompressed_layer"
+			readAttrs["content_cache_warm"] = warmDecision
 			return s.readFromDiskCacheObserved(ctx, node.Path, remote.LayerDigest, decompressedHash, layerPath, wantUStart, dest[:readLen])
 		}
 	}
@@ -393,7 +413,16 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				StartedAt:        cacheStart,
 				Duration:         time.Since(cacheStart),
 				Success:          true,
+				Attrs: map[string]string{
+					"cache_result":            "hit",
+					"cache_tier":              "embedded_content_cache",
+					"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
+					"storage_mode":            "oci",
+				},
 			})
+			readAttrs["cache_result"] = "hit"
+			readAttrs["cache_tier"] = "embedded_content_cache"
+			readAttrs["content_cache_result"] = "hit"
 			log.Debug().
 				Str("layer_digest", remote.LayerDigest).
 				Str("decompressed_hash", decompressedHash).
@@ -416,7 +445,14 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Duration:         time.Since(cacheStart),
 				Success:          false,
 				Error:            errorString(err),
+				Attrs: map[string]string{
+					"cache_result":            contentCacheErrorKind(err),
+					"cache_tier":              "embedded_content_cache",
+					"content_cache_available": fmt.Sprintf("%t", s.contentCacheAvailable),
+					"storage_mode":            "oci",
+				},
 			})
+			readAttrs["content_cache_result"] = contentCacheErrorKind(err)
 			log.Debug().
 				Err(err).
 				Str("layer_digest", remote.LayerDigest).
@@ -441,6 +477,9 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 		checkpointStart := time.Now()
 		if n, err := s.readWithCheckpoint(remote.LayerDigest, wantUStart, dest[:readLen]); err == nil {
 			readSource = "checkpoint"
+			readAttrs["cache_result"] = "miss"
+			readAttrs["cache_tier"] = "checkpoint"
+			readAttrs["fallback"] = "checkpoint"
 			s.observeRead(ctx, common.ReadTraceEvent{
 				Operation:   "clip.checkpoint_read",
 				Source:      "checkpoint",
@@ -452,6 +491,12 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				StartedAt:   checkpointStart,
 				Duration:    time.Since(checkpointStart),
 				Success:     true,
+				Attrs: map[string]string{
+					"cache_result": "miss",
+					"cache_tier":   "checkpoint",
+					"fallback":     "checkpoint",
+					"storage_mode": "oci",
+				},
 			})
 			log.Debug().
 				Str("layer_digest", remote.LayerDigest).
@@ -472,6 +517,12 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Duration:    time.Since(checkpointStart),
 				Success:     false,
 				Error:       errorString(err),
+				Attrs: map[string]string{
+					"cache_result": "miss",
+					"cache_tier":   "checkpoint",
+					"fallback":     "oci_decompress",
+					"storage_mode": "oci",
+				},
 			})
 			log.Debug().
 				Err(err).
@@ -488,6 +539,9 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 
 	// Now read the range we need from the newly cached layer
 	readSource = "decompressed_layer"
+	readAttrs["cache_result"] = "miss"
+	readAttrs["cache_tier"] = "oci_decompressed_layer"
+	readAttrs["fallback"] = "oci_decompress"
 	return s.readFromDiskCacheObserved(ctx, node.Path, remote.LayerDigest, decompressedHash, layerPath, wantUStart, dest[:readLen])
 }
 
@@ -505,7 +559,7 @@ func (s *OCIClipStorage) ensureLayerCached(ctx context.Context, digest string) (
 	// Fast path: check if already cached on disk (outside lock for performance)
 	if _, err := os.Stat(layerPath); err == nil {
 		log.Debug().Str("digest", digest).Str("decompressed_hash", decompressedHash).Msg("disk cache hit")
-		s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
+		s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, layerPath)
 		return decompressedHash, layerPath, nil
 	}
 
@@ -516,7 +570,7 @@ func (s *OCIClipStorage) ensureLayerCached(ctx context.Context, digest string) (
 		// between our fast-path stat and entering this call.
 		if _, err := os.Stat(layerPath); err == nil {
 			log.Debug().Str("digest", digest).Str("decompressed_hash", decompressedHash).Msg("disk cache hit (after global lock)")
-			s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
+			s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, layerPath)
 			return nil
 		}
 
@@ -669,6 +723,51 @@ func (s *OCIClipStorage) warmDecompressedLayerInContentCache(decompressedHash st
 	}
 }
 
+func (s *OCIClipStorage) scheduleDecompressedLayerContentCacheWarm(decompressedHash string, diskPath string) string {
+	if s.contentCache == nil {
+		return "disabled_no_cache"
+	}
+	if !s.contentCacheAvailable {
+		return "disabled_unavailable"
+	}
+	if decompressedHash == "" || diskPath == "" {
+		return "skipped_invalid_source"
+	}
+	if !s.markContentCacheWarmAttempt(decompressedHash) {
+		return "already_attempted"
+	}
+
+	go s.warmDecompressedLayerInContentCache(decompressedHash, diskPath)
+	return "scheduled"
+}
+
+func (s *OCIClipStorage) markContentCacheWarmAttempt(decompressedHash string) bool {
+	s.contentCacheWarmMu.Lock()
+	defer s.contentCacheWarmMu.Unlock()
+
+	if s.contentCacheWarmOnce == nil {
+		s.contentCacheWarmOnce = make(map[string]struct{})
+	}
+	if _, ok := s.contentCacheWarmOnce[decompressedHash]; ok {
+		return false
+	}
+	s.contentCacheWarmOnce[decompressedHash] = struct{}{}
+	return true
+}
+
+func contentCacheErrorKind(err error) string {
+	switch {
+	case err == nil:
+		return "hit"
+	case errors.Is(err, ErrContentCacheMiss):
+		return "miss"
+	case errors.Is(err, ErrContentCacheUnavailable):
+		return "unavailable"
+	default:
+		return "error"
+	}
+}
+
 // decompressAndCacheLayer decompresses a layer from OCI registry and caches it
 // This is called when both disk cache and ContentCache miss
 // The entire layer is cached so subsequent reads (on this or other nodes) can do range reads
@@ -727,7 +826,7 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 
 	decompressedHash := s.getDecompressedHash(digest)
 	if _, err := os.Stat(diskPath); err == nil {
-		s.warmDecompressedLayerInContentCache(decompressedHash, diskPath)
+		s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, diskPath)
 		return nil
 	}
 
@@ -735,7 +834,7 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 	// between our final stat and rename, treat that as success.
 	if err := os.Rename(tempPath, diskPath); err != nil {
 		if _, statErr := os.Stat(diskPath); statErr == nil {
-			s.warmDecompressedLayerInContentCache(decompressedHash, diskPath)
+			s.scheduleDecompressedLayerContentCacheWarm(decompressedHash, diskPath)
 			return nil
 		}
 		return fmt.Errorf("failed to rename temp file: %w", err)

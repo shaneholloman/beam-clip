@@ -332,11 +332,78 @@ func TestOCIStorage_ClientLocalFileViewUsesDiskCache(t *testing.T) {
 	assert.Equal(t, "disk_cache_fd", region.Source)
 	assert.Equal(t, digest.String(), region.LayerDigest)
 	assert.Equal(t, decompressedHash, region.DecompressedHash)
+	assert.Equal(t, "hit", region.Attrs["cache_result"])
+	assert.Equal(t, "local_decompressed_layer", region.Attrs["cache_tier"])
+
+	require.Eventually(t, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.setCalls == 1
+	}, time.Second, 10*time.Millisecond, "disk fd fast path should schedule one remote content cache repair")
 
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	assert.Equal(t, 1, cache.setCalls, "disk fd fast path should repair the remote content cache")
 	assert.Equal(t, testData, cache.store[decompressedHash])
+	cache.mu.Unlock()
+}
+
+func TestOCIStorage_ClientLocalFileViewWarmsContentCacheOncePerLayer(t *testing.T) {
+	testData := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	digest := v1.Hash{Algorithm: "sha256", Hex: "abc123"}
+	hasher := sha256.New()
+	hasher.Write(testData)
+	decompressedHash := hex.EncodeToString(hasher.Sum(nil))
+	cacheDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, decompressedHash), testData, 0644))
+
+	metadata := &common.ClipArchiveMetadata{
+		StorageInfo: &common.OCIStorageInfo{
+			GzipIdxByLayer: map[string]*common.GzipIndex{digest.String(): {}},
+			DecompressedHashByLayer: map[string]string{
+				digest.String(): decompressedHash,
+			},
+		},
+	}
+	cache := &localPathTrackingCache{
+		mockCache: mockCache{
+			store: make(map[string][]byte),
+		},
+	}
+	storage := &OCIClipStorage{
+		metadata:              metadata,
+		storageInfo:           metadata.StorageInfo.(*common.OCIStorageInfo),
+		diskCacheDir:          cacheDir,
+		contentCache:          cache,
+		contentCacheAvailable: true,
+	}
+	node := &common.ClipNode{
+		Remote: &common.RemoteRef{
+			LayerDigest: digest.String(),
+			UOffset:     0,
+			ULength:     int64(len(testData)),
+		},
+	}
+
+	for i := 0; i < 5; i++ {
+		region, ok, err := storage.ClientLocalFileView(context.Background(), node, int64(i), 1)
+		require.NoError(t, err)
+		require.True(t, ok)
+		assert.Equal(t, "disk_cache_fd", region.Source)
+	}
+
+	require.Eventually(t, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.localPathCalls == 1
+	}, time.Second, 10*time.Millisecond)
+
+	time.Sleep(25 * time.Millisecond)
+	cache.mu.Lock()
+	assert.Equal(t, 1, cache.localPathCalls, "local fd reads should not repeatedly enter remote cache local-path store")
+	assert.Equal(t, 0, cache.setCalls, "local path store should avoid streaming StoreContent fallback")
+	assert.Equal(t, filepath.Join(cacheDir, decompressedHash), cache.localPath)
+	assert.Equal(t, decompressedHash, cache.routingKey)
+	assert.Equal(t, testData, cache.store[decompressedHash])
+	cache.mu.Unlock()
 }
 
 func TestOCIStorage_ReadFileDiskCacheHitWarmsContentCache(t *testing.T) {
@@ -380,10 +447,18 @@ func TestOCIStorage_ReadFileDiskCacheHitWarmsContentCache(t *testing.T) {
 	require.Equal(t, testData[3:10], dest)
 
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
 	assert.Equal(t, 0, cache.getCalls, "disk cache hit should not do a remote range read")
-	assert.Equal(t, 1, cache.setCalls, "disk cache hit should repair the remote content cache")
+	cache.mu.Unlock()
+
+	require.Eventually(t, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.setCalls == 1
+	}, time.Second, 10*time.Millisecond, "disk cache hit should schedule one remote content cache repair")
+
+	cache.mu.Lock()
 	assert.Equal(t, testData, cache.store[decompressedHash])
+	cache.mu.Unlock()
 }
 
 func TestOCIStorage_ClientLocalFileViewUsesContentCachePage(t *testing.T) {
@@ -431,6 +506,8 @@ func TestOCIStorage_ClientLocalFileViewUsesContentCachePage(t *testing.T) {
 	assert.Equal(t, int64(1234), region.Offset)
 	assert.Equal(t, 9, region.Length)
 	assert.Equal(t, "client_local_page_file_fd", region.Source)
+	assert.Equal(t, "hit", region.Attrs["cache_result"])
+	assert.Equal(t, "embedded_page_file", region.Attrs["cache_tier"])
 	assert.Equal(t, 1, cache.clientLocalPageFileViewCalls)
 	assert.Equal(t, int64(4101), cache.clientLocalPageFileViewOffset)
 	assert.Equal(t, int64(9), cache.clientLocalPageFileViewLength)
