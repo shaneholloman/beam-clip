@@ -307,10 +307,12 @@ func TestOCIStorage_ClientLocalFileViewUsesDiskCache(t *testing.T) {
 			},
 		},
 	}
+	cache := newMockCache()
 	storage := &OCIClipStorage{
 		metadata:              metadata,
 		storageInfo:           metadata.StorageInfo.(*common.OCIStorageInfo),
 		diskCacheDir:          cacheDir,
+		contentCache:          cache,
 		contentCacheAvailable: true,
 	}
 	node := &common.ClipNode{
@@ -330,6 +332,58 @@ func TestOCIStorage_ClientLocalFileViewUsesDiskCache(t *testing.T) {
 	assert.Equal(t, "disk_cache_fd", region.Source)
 	assert.Equal(t, digest.String(), region.LayerDigest)
 	assert.Equal(t, decompressedHash, region.DecompressedHash)
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	assert.Equal(t, 1, cache.setCalls, "disk fd fast path should repair the remote content cache")
+	assert.Equal(t, testData, cache.store[decompressedHash])
+}
+
+func TestOCIStorage_ReadFileDiskCacheHitWarmsContentCache(t *testing.T) {
+	testData := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	digest := v1.Hash{Algorithm: "sha256", Hex: "abc123"}
+	hasher := sha256.New()
+	hasher.Write(testData)
+	decompressedHash := hex.EncodeToString(hasher.Sum(nil))
+	cacheDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, decompressedHash), testData, 0644))
+
+	metadata := &common.ClipArchiveMetadata{
+		StorageInfo: &common.OCIStorageInfo{
+			GzipIdxByLayer: map[string]*common.GzipIndex{digest.String(): {}},
+			DecompressedHashByLayer: map[string]string{
+				digest.String(): decompressedHash,
+			},
+		},
+	}
+	cache := newMockCache()
+	storage := &OCIClipStorage{
+		metadata:              metadata,
+		storageInfo:           metadata.StorageInfo.(*common.OCIStorageInfo),
+		diskCacheDir:          cacheDir,
+		contentCache:          cache,
+		contentCacheAvailable: true,
+	}
+	node := &common.ClipNode{
+		Path: "/file",
+		Remote: &common.RemoteRef{
+			LayerDigest: digest.String(),
+			UOffset:     0,
+			ULength:     int64(len(testData)),
+		},
+	}
+
+	dest := make([]byte, 7)
+	n, err := storage.ReadFile(node, dest, 3)
+	require.NoError(t, err)
+	require.Equal(t, 7, n)
+	require.Equal(t, testData[3:10], dest)
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	assert.Equal(t, 0, cache.getCalls, "disk cache hit should not do a remote range read")
+	assert.Equal(t, 1, cache.setCalls, "disk cache hit should repair the remote content cache")
+	assert.Equal(t, testData, cache.store[decompressedHash])
 }
 
 func TestOCIStorage_ClientLocalFileViewUsesContentCachePage(t *testing.T) {

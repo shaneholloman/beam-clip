@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -151,15 +152,113 @@ func (m *mockS3Storage) resetTrackingFields() {
 	m.mu.Unlock()
 }
 
+func newLegacyLocalCacheTestFS(t *testing.T, data []byte) (*ClipFileSystem, *FSNode, *mockContentCache, string) {
+	t.Helper()
+
+	sum := sha256.Sum256(data)
+	contentHash := hex.EncodeToString(sum[:])
+	archivePath := t.TempDir() + "/archive.clip"
+	require.NoError(t, os.WriteFile(archivePath, data, 0644))
+
+	now := uint64(time.Now().Unix())
+	rootNode := &common.ClipNode{
+		Path:     "/",
+		NodeType: common.DirNode,
+		Attr: fuse.Attr{
+			Ino:   1,
+			Mode:  fuse.S_IFDIR | 0755,
+			Nlink: 2,
+			Atime: now,
+			Mtime: now,
+			Ctime: now,
+		},
+	}
+	fileNode := &common.ClipNode{
+		Path:        "/file.txt",
+		NodeType:    common.FileNode,
+		ContentHash: contentHash,
+		DataLen:     int64(len(data)),
+		DataPos:     0,
+		Attr: fuse.Attr{
+			Ino:   2,
+			Size:  uint64(len(data)),
+			Mode:  fuse.S_IFREG | 0644,
+			Nlink: 1,
+			Atime: now,
+			Mtime: now,
+			Ctime: now,
+		},
+	}
+
+	clipNodeLess := func(a, b interface{}) bool {
+		aNode := a.(*common.ClipNode)
+		bNode := b.(*common.ClipNode)
+		return aNode.Path < bNode.Path
+	}
+	index := btree.NewOptions(clipNodeLess, btree.Options{NoLocks: true})
+	index.Set(rootNode)
+	index.Set(fileNode)
+
+	metadata := &common.ClipArchiveMetadata{Index: index}
+	localStorage, err := storage.NewLocalClipStorage(metadata, storage.LocalClipStorageOpts{ArchivePath: archivePath})
+	require.NoError(t, err)
+
+	cache := newMockContentCache()
+	clipFS, err := NewFileSystem(localStorage, ClipFileSystemOpts{
+		ContentCache:          cache,
+		ContentCacheAvailable: true,
+	})
+	require.NoError(t, err)
+
+	return clipFS, &FSNode{filesystem: clipFS, clipNode: fileNode, attr: fileNode.Attr}, cache, contentHash
+}
+
+func TestLegacyClientLocalFileViewReadWarmsContentCache(t *testing.T) {
+	testData := []byte("legacy local archive data")
+	_, fileNode, cache, contentHash := newLegacyLocalCacheTestFS(t, testData)
+	fh := newClipFileHandle(fileNode)
+	defer fh.Release(context.Background())
+
+	dest := make([]byte, len(testData))
+	result, errno := fh.Read(context.Background(), dest, 0)
+	require.Equal(t, fs.OK, errno)
+	readData, status := result.Bytes(dest)
+	require.Equal(t, fuse.OK, status)
+	require.Equal(t, testData, readData)
+
+	require.NoError(t, cache.WaitForStore(contentHash, time.Second))
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.False(t, cache.getCalled, "fd fast path should not require a content-cache read")
+	require.Equal(t, testData, cache.store[contentHash])
+}
+
+func TestLegacyLocalArchiveReadWarmsContentCache(t *testing.T) {
+	testData := []byte("legacy direct archive data")
+	_, fileNode, cache, contentHash := newLegacyLocalCacheTestFS(t, testData)
+
+	dest := make([]byte, len(testData))
+	result, errno := fileNode.readData(context.Background(), dest, 0)
+	require.Equal(t, fs.OK, errno)
+	readData, status := result.Bytes(dest)
+	require.Equal(t, fuse.OK, status)
+	require.Equal(t, testData, readData)
+
+	require.NoError(t, cache.WaitForStore(contentHash, time.Second))
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.Equal(t, testData, cache.store[contentHash])
+}
+
 func Test_FSNodeLookupAndRead(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping Docker-dependent test in short mode")
 	}
-	
+
 	// This test requires Docker to be running (testcontainers)
 	// Skip in all environments to avoid CI failures
 	t.Skip("Skipping Docker-dependent integration test - requires Docker daemon")
-	
+
 	ctx := context.Background()
 
 	req := tc.ContainerRequest{

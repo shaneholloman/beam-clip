@@ -76,6 +76,10 @@ func (cfs *ClipFileSystem) Root() (fs.InodeEmbedder, error) {
 }
 
 func (cfs *ClipFileSystem) CacheFile(node *FSNode) {
+	if cfs == nil || !cfs.contentCacheAvailable || cfs.contentCache == nil || node == nil || node.clipNode == nil || node.clipNode.ContentHash == "" {
+		return
+	}
+
 	hash := node.clipNode.ContentHash
 
 	// Check and update caching status

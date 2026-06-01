@@ -272,6 +272,7 @@ func (s *OCIClipStorage) ClientLocalFileView(ctx context.Context, node *common.C
 
 	layerPath := s.getDecompressedCachePath(decompressedHash)
 	if _, err := os.Stat(layerPath); err == nil {
+		s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
 		return ClientLocalFileView{
 			Path:             layerPath,
 			Offset:           wantUStart,
@@ -366,6 +367,7 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Int64("offset", wantUStart).
 				Int64("length", readLen).
 				Msg("disk cache hit - using local decompressed layer")
+			s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
 			metrics.RecordReadHit()
 			readSource = "disk_cache"
 			return s.readFromDiskCacheObserved(ctx, node.Path, remote.LayerDigest, decompressedHash, layerPath, wantUStart, dest[:readLen])
@@ -503,6 +505,7 @@ func (s *OCIClipStorage) ensureLayerCached(ctx context.Context, digest string) (
 	// Fast path: check if already cached on disk (outside lock for performance)
 	if _, err := os.Stat(layerPath); err == nil {
 		log.Debug().Str("digest", digest).Str("decompressed_hash", decompressedHash).Msg("disk cache hit")
+		s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
 		return decompressedHash, layerPath, nil
 	}
 
@@ -513,6 +516,7 @@ func (s *OCIClipStorage) ensureLayerCached(ctx context.Context, digest string) (
 		// between our fast-path stat and entering this call.
 		if _, err := os.Stat(layerPath); err == nil {
 			log.Debug().Str("digest", digest).Str("decompressed_hash", decompressedHash).Msg("disk cache hit (after global lock)")
+			s.warmDecompressedLayerInContentCache(decompressedHash, layerPath)
 			return nil
 		}
 
@@ -652,6 +656,19 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+func (s *OCIClipStorage) warmDecompressedLayerInContentCache(decompressedHash string, diskPath string) {
+	if s.contentCache == nil || !s.contentCacheAvailable || decompressedHash == "" || diskPath == "" {
+		return
+	}
+	if err := s.storeDecompressedInRemoteCache(decompressedHash, diskPath); err != nil {
+		log.Warn().
+			Err(err).
+			Str("decompressed_hash", decompressedHash).
+			Str("path", diskPath).
+			Msg("content cache store failed while warming decompressed layer")
+	}
+}
+
 // decompressAndCacheLayer decompresses a layer from OCI registry and caches it
 // This is called when both disk cache and ContentCache miss
 // The entire layer is cached so subsequent reads (on this or other nodes) can do range reads
@@ -708,7 +725,9 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 		return fmt.Errorf("failed to decompress layer to disk: %w", err)
 	}
 
+	decompressedHash := s.getDecompressedHash(digest)
 	if _, err := os.Stat(diskPath); err == nil {
+		s.warmDecompressedLayerInContentCache(decompressedHash, diskPath)
 		return nil
 	}
 
@@ -716,6 +735,7 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 	// between our final stat and rename, treat that as success.
 	if err := os.Rename(tempPath, diskPath); err != nil {
 		if _, statErr := os.Stat(diskPath); statErr == nil {
+			s.warmDecompressedLayerInContentCache(decompressedHash, diskPath)
 			return nil
 		}
 		return fmt.Errorf("failed to rename temp file: %w", err)
@@ -735,7 +755,6 @@ func (s *OCIClipStorage) decompressAndCacheLayer(digest string, diskPath string)
 	// workload can finish, the worker can be deleted, and the background store
 	// can be lost before the next worker tries to reuse the layer.
 	if s.contentCache != nil && s.contentCacheAvailable {
-		decompressedHash := s.getDecompressedHash(digest)
 		if err := s.storeDecompressedInRemoteCache(decompressedHash, diskPath); err != nil {
 			log.Warn().
 				Err(err).
@@ -849,6 +868,10 @@ func (s *OCIClipStorage) tryRangeReadFromContentCache(decompressedHash string, o
 // storeDecompressedInRemoteCache uploads decompressed layer to remote cache for cluster sharing.
 // Streams file in 32MB chunks with constant memory usage O(32MB).
 func (s *OCIClipStorage) storeDecompressedInRemoteCache(decompressedHash string, diskPath string) error {
+	if decompressedHash == "" {
+		return fmt.Errorf("decompressed hash is required for content cache store")
+	}
+
 	// Guard against nil contentCache or unavailable cache
 	if s.contentCache == nil {
 		log.Debug().

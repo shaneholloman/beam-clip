@@ -43,6 +43,9 @@ func (fh *clipFileHandle) Read(ctx context.Context, dest []byte, off int64) (fus
 		ctx = common.WithReadTraceCallerPID(ctx, caller.Pid)
 	}
 	if res, ok, errno := fh.readClientLocalFileView(ctx, dest, off); ok || errno != fs.OK {
+		if ok && errno == fs.OK {
+			fh.node.maybeWarmLegacyContentCache()
+		}
 		return res, errno
 	}
 	return fh.node.readData(ctx, dest, off)
@@ -301,10 +304,7 @@ func (n *FSNode) readData(ctx context.Context, dest []byte, off int64) (fuse.Rea
 					return nil, syscall.EIO
 				}
 
-				// Asynchronously cache the file for future reads
-				go func() {
-					n.filesystem.CacheFile(n)
-				}()
+				n.maybeWarmLegacyContentCache()
 				log.Debug().Str("path", n.clipNode.Path).Int64("offset", off).Int64("length", readLen).Msg("Cache miss")
 			}
 		} else {
@@ -314,6 +314,7 @@ func (n *FSNode) readData(ctx context.Context, dest []byte, off int64) (fuse.Rea
 			if err != nil {
 				return nil, syscall.EIO
 			}
+			n.maybeWarmLegacyContentCache()
 		}
 	}
 
@@ -343,6 +344,13 @@ func (n *FSNode) fileSize() int64 {
 		return n.clipNode.Remote.ULength
 	}
 	return n.clipNode.DataLen
+}
+
+func (n *FSNode) maybeWarmLegacyContentCache() {
+	if n == nil || n.clipNode == nil || n.clipNode.Remote != nil || n.filesystem == nil {
+		return
+	}
+	n.filesystem.CacheFile(n)
 }
 
 func (n *FSNode) clientLocalFileViewReadTrace(view storage.ClientLocalFileView, off int64, readLen int64, bytesRead int64, started time.Time, err error) common.ReadTraceEvent {
