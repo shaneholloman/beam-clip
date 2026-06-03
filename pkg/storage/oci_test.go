@@ -1903,6 +1903,61 @@ func TestCheckpointBasedReading(t *testing.T) {
 	t.Log("? Checkpoint-based reading test passed!")
 }
 
+func TestCheckpointReadMaterializesContentCache(t *testing.T) {
+	testData := bytes.Repeat([]byte("checkpoint-cache-"), 1024)
+	compressedData := createGzipData(t, testData)
+	digest := v1.Hash{Algorithm: "sha256", Hex: "checkpoint_cache_store"}
+
+	hasher := sha256.New()
+	hasher.Write(testData)
+	decompressedHash := hex.EncodeToString(hasher.Sum(nil))
+
+	metadata := &common.ClipArchiveMetadata{
+		StorageInfo: &common.OCIStorageInfo{
+			GzipIdxByLayer: map[string]*common.GzipIndex{
+				digest.String(): {
+					LayerDigest: digest.String(),
+					Checkpoints: []common.GzipCheckpoint{{COff: 0, UOff: 0}},
+				},
+			},
+			DecompressedHashByLayer: map[string]string{
+				digest.String(): decompressedHash,
+			},
+		},
+	}
+	cache := newMockCache()
+	storage := &OCIClipStorage{
+		metadata:              metadata,
+		storageInfo:           metadata.StorageInfo.(*common.OCIStorageInfo),
+		layerCache:            map[string]v1.Layer{digest.String(): &mockLayer{digest: digest, compressedData: compressedData}},
+		diskCacheDir:          t.TempDir(),
+		contentCache:          cache,
+		contentCacheAvailable: true,
+		useCheckpoints:        true,
+	}
+
+	node := &common.ClipNode{
+		Remote: &common.RemoteRef{
+			LayerDigest: digest.String(),
+			UOffset:     0,
+			ULength:     int64(len(testData)),
+		},
+	}
+	dest := make([]byte, 128)
+	n, err := storage.ReadFile(node, dest, 64)
+	require.NoError(t, err)
+	require.Equal(t, len(dest), n)
+	require.Equal(t, testData[64:64+len(dest)], dest)
+
+	cache.mu.Lock()
+	stored := append([]byte(nil), cache.store[decompressedHash]...)
+	setCalls := cache.setCalls
+	cache.mu.Unlock()
+	require.Equal(t, 1, setCalls)
+	require.Equal(t, testData, stored)
+	require.FileExists(t, storage.getDecompressedCachePath(decompressedHash))
+}
+
 // TestCheckpointFallback tests that checkpoint mode falls back to full decompression when needed
 func TestCheckpointFallback(t *testing.T) {
 	testData := []byte("Test data for checkpoint fallback")

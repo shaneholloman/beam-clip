@@ -504,6 +504,15 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 				Int64("length", readLen).
 				Int("bytes_read", n).
 				Msg("checkpoint-based decompression successful")
+			if s.contentCache != nil && s.contentCacheAvailable && decompressedHash != "" {
+				if _, _, cacheErr := s.ensureLayerCached(ctx, remote.LayerDigest); cacheErr != nil {
+					log.Warn().
+						Err(cacheErr).
+						Str("layer_digest", remote.LayerDigest).
+						Str("decompressed_hash", decompressedHash).
+						Msg("failed to materialize decompressed layer after checkpoint read")
+				}
+			}
 			return n, nil
 		} else {
 			s.observeRead(ctx, common.ReadTraceEvent{
