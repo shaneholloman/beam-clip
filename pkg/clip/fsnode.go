@@ -254,7 +254,14 @@ func (n *FSNode) readData(ctx context.Context, dest []byte, off int64) (fuse.Rea
 		if n.filesystem.contentCacheAvailable && n.clipNode.ContentHash != "" && !n.filesystem.storage.CachedLocally() {
 			var cacheErr error
 			cacheStart := time.Now()
-			if readInto, ok := n.filesystem.contentCache.(storage.ContentCacheReadInto); ok {
+			if readAhead := n.filesystem.contentCacheReadAhead; readAhead != nil {
+				var n64 int64
+				n64, cacheErr = readAhead.Read(n.clipNode.ContentHash, off, dest[:readLen], struct{ RoutingKey string }{RoutingKey: n.clipNode.ContentHash}, n.clipNode.DataLen)
+				nRead = int(n64)
+				if cacheErr == nil && n64 != readLen {
+					cacheErr = syscall.EIO
+				}
+			} else if readInto, ok := n.filesystem.contentCache.(storage.ContentCacheReadInto); ok {
 				var n64 int64
 				n64, cacheErr = readInto.ReadContentInto(n.clipNode.ContentHash, off, dest[:readLen], struct{ RoutingKey string }{RoutingKey: n.clipNode.ContentHash})
 				nRead = int(n64)

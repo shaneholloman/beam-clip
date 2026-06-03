@@ -18,6 +18,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/testcontainers/testcontainers-go v0.35.0
 	github.com/tidwall/btree v1.6.0
+	golang.org/x/sync v0.10.0
 	golang.org/x/sys v0.30.0
 )
 
@@ -102,5 +103,4 @@ require (
 	github.com/docker/docker-credential-helpers v0.8.2 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/vbatts/tar-split v0.11.6 // indirect
-	golang.org/x/sync v0.10.0 // indirect
 )

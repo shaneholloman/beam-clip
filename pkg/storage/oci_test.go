@@ -35,6 +35,8 @@ type mockCache struct {
 	// Call tracking
 	getCalls                      int
 	setCalls                      int
+	getOffsets                    []int64
+	getLengths                    []int64
 	clientLocalPageFileViewCalls  int
 	clientLocalPageFileViewOffset int64
 	clientLocalPageFileViewLength int64
@@ -52,6 +54,8 @@ func (m *mockCache) GetContent(hash string, offset int64, length int64, opts str
 	defer m.mu.Unlock()
 
 	m.getCalls++
+	m.getOffsets = append(m.getOffsets, offset)
+	m.getLengths = append(m.getLengths, length)
 
 	if m.getError != nil {
 		return nil, m.getError
@@ -117,6 +121,8 @@ func (m *mockCache) reset() {
 	m.clientLocalPageFileViews = make(map[string][]ClientLocalPageFileView)
 	m.getCalls = 0
 	m.setCalls = 0
+	m.getOffsets = nil
+	m.getLengths = nil
 	m.clientLocalPageFileViewCalls = 0
 	m.clientLocalPageFileViewOffset = 0
 	m.clientLocalPageFileViewLength = 0
@@ -511,6 +517,65 @@ func TestOCIStorage_ClientLocalFileViewUsesContentCachePage(t *testing.T) {
 	assert.Equal(t, 1, cache.clientLocalPageFileViewCalls)
 	assert.Equal(t, int64(4101), cache.clientLocalPageFileViewOffset)
 	assert.Equal(t, int64(9), cache.clientLocalPageFileViewLength)
+}
+
+func TestOCIStorage_ContentCacheReadAheadCoalescesAdjacentReads(t *testing.T) {
+	testData := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	digest := v1.Hash{Algorithm: "sha256", Hex: "abc123"}
+	sum := sha256.Sum256(testData)
+	decompressedHash := hex.EncodeToString(sum[:])
+
+	cache := newMockCache()
+	cache.store[decompressedHash] = testData
+	metadata := &common.ClipArchiveMetadata{
+		StorageInfo: &common.OCIStorageInfo{
+			DecompressedHashByLayer: map[string]string{
+				digest.String(): decompressedHash,
+			},
+		},
+	}
+	storage := &OCIClipStorage{
+		metadata:              metadata,
+		storageInfo:           metadata.StorageInfo.(*common.OCIStorageInfo),
+		diskCacheDir:          t.TempDir(),
+		contentCache:          cache,
+		contentCacheAvailable: true,
+		contentCacheReadAhead: NewContentCacheReadAhead(cache, ContentCacheReadAheadOptions{WindowBytes: 16, MaxWindows: 2}),
+		layerLimitByHash: map[string]int64{
+			decompressedHash: int64(len(testData)),
+		},
+	}
+	node := &common.ClipNode{
+		Remote: &common.RemoteRef{
+			LayerDigest: digest.String(),
+			UOffset:     0,
+			ULength:     int64(len(testData)),
+		},
+	}
+
+	first := make([]byte, 4)
+	n, err := storage.ReadFile(node, first, 3)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Equal(t, []byte("3456"), first)
+
+	second := make([]byte, 4)
+	n, err = storage.ReadFile(node, second, 10)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Equal(t, []byte("abcd"), second)
+
+	third := make([]byte, 4)
+	n, err = storage.ReadFile(node, third, 20)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Equal(t, []byte("klmn"), third)
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.Equal(t, 2, cache.getCalls)
+	require.Equal(t, []int64{0, 16}, cache.getOffsets)
+	require.Equal(t, []int64{16, 16}, cache.getLengths)
 }
 
 func TestOCIStorage_CacheMiss(t *testing.T) {

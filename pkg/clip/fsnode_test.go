@@ -36,8 +36,11 @@ type mockContentCache struct {
 	storeDoneMu sync.Mutex               // Protects storeDone map
 
 	// Tracking fields for assertions
-	getCalled bool
-	getError  error
+	getCalled  bool
+	getCalls   int
+	getOffsets []int64
+	getLengths []int64
+	getError   error
 }
 
 func newMockContentCache() *mockContentCache {
@@ -50,6 +53,9 @@ func newMockContentCache() *mockContentCache {
 func (m *mockContentCache) resetTrackingFields() {
 	m.mu.Lock()
 	m.getCalled = false
+	m.getCalls = 0
+	m.getOffsets = nil
+	m.getLengths = nil
 	m.getError = nil
 	m.mu.Unlock()
 }
@@ -59,6 +65,9 @@ func (m *mockContentCache) GetContent(hash string, offset int64, length int64, o
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getCalled = true // Track that GetContent was called
+	m.getCalls++
+	m.getOffsets = append(m.getOffsets, offset)
+	m.getLengths = append(m.getLengths, length)
 
 	data, found := m.store[hash]
 	if found {
@@ -150,6 +159,36 @@ func (m *mockS3Storage) resetTrackingFields() {
 	m.mu.Lock()
 	m.readFileCalled = false
 	m.mu.Unlock()
+}
+
+type mockRemoteClipStorage struct {
+	metadata *common.ClipArchiveMetadata
+	data     []byte
+
+	mu        sync.Mutex
+	readCalls int
+}
+
+func (m *mockRemoteClipStorage) ReadFile(node *common.ClipNode, dest []byte, offset int64) (int, error) {
+	m.mu.Lock()
+	m.readCalls++
+	m.mu.Unlock()
+	if offset >= int64(len(m.data)) {
+		return 0, nil
+	}
+	return copy(dest, m.data[offset:]), nil
+}
+
+func (m *mockRemoteClipStorage) Metadata() *common.ClipArchiveMetadata {
+	return m.metadata
+}
+
+func (m *mockRemoteClipStorage) CachedLocally() bool {
+	return false
+}
+
+func (m *mockRemoteClipStorage) Cleanup() error {
+	return nil
 }
 
 func newLegacyLocalCacheTestFS(t *testing.T, data []byte) (*ClipFileSystem, *FSNode, *mockContentCache, string) {
@@ -248,6 +287,88 @@ func TestLegacyLocalArchiveReadWarmsContentCache(t *testing.T) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	require.Equal(t, testData, cache.store[contentHash])
+}
+
+func TestLegacyContentCacheReadAheadCoalescesAdjacentReads(t *testing.T) {
+	data := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	sum := sha256.Sum256(data)
+	contentHash := hex.EncodeToString(sum[:])
+	now := uint64(time.Now().Unix())
+	rootNode := &common.ClipNode{
+		Path:     "/",
+		NodeType: common.DirNode,
+		Attr: fuse.Attr{
+			Ino:   1,
+			Mode:  fuse.S_IFDIR | 0755,
+			Nlink: 2,
+			Atime: now,
+			Mtime: now,
+			Ctime: now,
+		},
+	}
+	fileNode := &common.ClipNode{
+		Path:        "/file.txt",
+		NodeType:    common.FileNode,
+		ContentHash: contentHash,
+		DataLen:     int64(len(data)),
+		Attr: fuse.Attr{
+			Ino:   2,
+			Size:  uint64(len(data)),
+			Mode:  fuse.S_IFREG | 0644,
+			Nlink: 1,
+			Atime: now,
+			Mtime: now,
+			Ctime: now,
+		},
+	}
+	index := btree.NewOptions(func(a, b interface{}) bool {
+		return a.(*common.ClipNode).Path < b.(*common.ClipNode).Path
+	}, btree.Options{NoLocks: true})
+	index.Set(rootNode)
+	index.Set(fileNode)
+	metadata := &common.ClipArchiveMetadata{Index: index}
+	remoteStorage := &mockRemoteClipStorage{metadata: metadata, data: data}
+
+	cache := newMockContentCache()
+	cache.store[contentHash] = data
+	clipFS, err := NewFileSystem(remoteStorage, ClipFileSystemOpts{
+		ContentCache:          cache,
+		ContentCacheAvailable: true,
+	})
+	require.NoError(t, err)
+	clipFS.contentCacheReadAhead = storage.NewContentCacheReadAhead(cache, storage.ContentCacheReadAheadOptions{WindowBytes: 16, MaxWindows: 2})
+	node := &FSNode{filesystem: clipFS, clipNode: fileNode, attr: fileNode.Attr}
+
+	first := make([]byte, 4)
+	result, errno := node.readData(context.Background(), first, 3)
+	require.Equal(t, fs.OK, errno)
+	readData, status := result.Bytes(first)
+	require.Equal(t, fuse.OK, status)
+	require.Equal(t, []byte("3456"), readData)
+
+	second := make([]byte, 4)
+	result, errno = node.readData(context.Background(), second, 10)
+	require.Equal(t, fs.OK, errno)
+	readData, status = result.Bytes(second)
+	require.Equal(t, fuse.OK, status)
+	require.Equal(t, []byte("abcd"), readData)
+
+	third := make([]byte, 4)
+	result, errno = node.readData(context.Background(), third, 20)
+	require.Equal(t, fs.OK, errno)
+	readData, status = result.Bytes(third)
+	require.Equal(t, fuse.OK, status)
+	require.Equal(t, []byte("klmn"), readData)
+
+	cache.mu.Lock()
+	require.Equal(t, 2, cache.getCalls)
+	require.Equal(t, []int64{0, 16}, cache.getOffsets)
+	require.Equal(t, []int64{16, 16}, cache.getLengths)
+	cache.mu.Unlock()
+
+	remoteStorage.mu.Lock()
+	require.Zero(t, remoteStorage.readCalls)
+	remoteStorage.mu.Unlock()
 }
 
 func Test_FSNodeLookupAndRead(t *testing.T) {

@@ -23,6 +23,7 @@ type ClipFileSystem struct {
 	root                  *FSNode
 	lookupCache           map[string]*lookupCacheEntry
 	contentCache          storage.ContentCache
+	contentCacheReadAhead *storage.ContentCacheReadAhead
 	contentCacheAvailable bool
 	readTraceObserver     common.ReadTraceObserver
 	cacheMutex            sync.RWMutex
@@ -45,6 +46,7 @@ func NewFileSystem(s storage.ClipStorageInterface, opts ClipFileSystemOpts) (*Cl
 		storage:               s,
 		lookupCache:           make(map[string]*lookupCacheEntry),
 		contentCache:          opts.ContentCache,
+		contentCacheReadAhead: storage.NewContentCacheReadAhead(opts.ContentCache, storage.ContentCacheReadAheadOptions{}),
 		cacheEventChan:        make(chan cacheEvent, 10000),
 		cachingStatus:         make(map[string]bool),
 		contentCacheAvailable: opts.ContentCacheAvailable,

@@ -37,6 +37,8 @@ type OCIClipStorage struct {
 	mu                    sync.RWMutex
 	contentCacheWarmMu    sync.Mutex
 	contentCacheWarmOnce  map[string]struct{}
+	contentCacheReadAhead *ContentCacheReadAhead
+	layerLimitByHash      map[string]int64
 }
 
 var globalLayerDecompress = newLayerDecompressGroup()
@@ -128,6 +130,8 @@ func NewOCIClipStorage(opts OCIClipStorageOpts) (*OCIClipStorage, error) {
 		useCheckpoints:        opts.UseCheckpoints,
 		readTraceObserver:     opts.ReadTraceObserver,
 		contentCacheWarmOnce:  make(map[string]struct{}),
+		contentCacheReadAhead: NewContentCacheReadAhead(opts.ContentCache, ContentCacheReadAheadOptions{}),
+		layerLimitByHash:      ociLayerLimitsByHash(opts.Metadata, &storageInfo),
 	}
 
 	log.Info().
@@ -397,7 +401,7 @@ func (s *OCIClipStorage) ReadFileContext(ctx context.Context, node *common.ClipN
 	// Try remote ContentCache range read
 	if s.contentCache != nil && decompressedHash != "" && s.contentCacheAvailable {
 		cacheStart := time.Now()
-		if n, err := s.tryRangeReadFromContentCache(decompressedHash, wantUStart, dest[:readLen]); err == nil {
+		if n, err := s.tryRangeReadFromContentCache(decompressedHash, wantUStart, dest[:readLen], s.contentCacheReadLimit(decompressedHash, remote)); err == nil {
 			metrics.RecordReadHit()
 			metrics.RecordRangeGet(decompressedHash, int64(n))
 			readSource = "content_cache"
@@ -944,15 +948,15 @@ func streamFileInChunksUntil(filePath string, chunks chan []byte, done <-chan st
 // tryRangeReadFromContentCache attempts a ranged read from remote ContentCache
 // This enables lazy loading: we fetch only the bytes we need, not the entire layer
 // decompressedHash is the hash of the decompressed layer data
-func (s *OCIClipStorage) tryRangeReadFromContentCache(decompressedHash string, offset int64, dest []byte) (int, error) {
+func (s *OCIClipStorage) tryRangeReadFromContentCache(decompressedHash string, offset int64, dest []byte, limit int64) (int, error) {
 	// Defensive nil check (should already be checked by caller)
 	if s.contentCache == nil {
 		return 0, fmt.Errorf("content cache is not available")
 	}
 
 	length := int64(len(dest))
-	if readInto, ok := s.contentCache.(ContentCacheReadInto); ok {
-		n, err := readInto.ReadContentInto(decompressedHash, offset, dest, struct{ RoutingKey string }{RoutingKey: decompressedHash})
+	if readAhead := s.getContentCacheReadAhead(); readAhead != nil {
+		n, err := readAhead.Read(decompressedHash, offset, dest, struct{ RoutingKey string }{RoutingKey: decompressedHash}, limit)
 		if err != nil {
 			return 0, fmt.Errorf("content cache range read failed: %w", err)
 		}
@@ -962,15 +966,68 @@ func (s *OCIClipStorage) tryRangeReadFromContentCache(decompressedHash string, o
 		return int(n), nil
 	}
 
-	// Use GetContent for range reads (offset + length)
-	// This is the KEY optimization: we only fetch the bytes we need!
-	data, err := s.contentCache.GetContent(decompressedHash, offset, length, struct{ RoutingKey string }{RoutingKey: decompressedHash})
+	n, err := readContentCacheInto(s.contentCache, decompressedHash, offset, dest, struct{ RoutingKey string }{RoutingKey: decompressedHash})
 	if err != nil {
 		return 0, fmt.Errorf("content cache range read failed: %w", err)
 	}
+	if n != length {
+		return 0, fmt.Errorf("content cache short read: want %d, got %d", length, n)
+	}
+	return int(n), nil
+}
 
-	copy(dest, data)
-	return len(data), nil
+func (s *OCIClipStorage) getContentCacheReadAhead() *ContentCacheReadAhead {
+	if s == nil || s.contentCache == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.contentCacheReadAhead == nil {
+		s.contentCacheReadAhead = NewContentCacheReadAhead(s.contentCache, ContentCacheReadAheadOptions{})
+	}
+	return s.contentCacheReadAhead
+}
+
+func (s *OCIClipStorage) contentCacheReadLimit(decompressedHash string, remote *common.RemoteRef) int64 {
+	if s == nil || decompressedHash == "" {
+		return 0
+	}
+	s.mu.Lock()
+	if s.layerLimitByHash == nil {
+		s.layerLimitByHash = ociLayerLimitsByHash(s.metadata, s.storageInfo)
+	}
+	limit := s.layerLimitByHash[decompressedHash]
+	s.mu.Unlock()
+	if limit > 0 {
+		return limit
+	}
+	if remote != nil && remote.UOffset >= 0 && remote.ULength > 0 {
+		return remote.UOffset + remote.ULength
+	}
+	return 0
+}
+
+func ociLayerLimitsByHash(metadata *common.ClipArchiveMetadata, storageInfo *common.OCIStorageInfo) map[string]int64 {
+	if metadata == nil || metadata.Index == nil || storageInfo == nil {
+		return nil
+	}
+	limits := make(map[string]int64)
+	metadata.Index.Ascend(nil, func(item interface{}) bool {
+		node, ok := item.(*common.ClipNode)
+		if !ok || node == nil || node.Remote == nil {
+			return true
+		}
+		hash := storageInfo.DecompressedHashByLayer[node.Remote.LayerDigest]
+		if hash == "" {
+			return true
+		}
+		end := node.Remote.UOffset + node.Remote.ULength
+		if end > limits[hash] {
+			limits[hash] = end
+		}
+		return true
+	})
+	return limits
 }
 
 // storeDecompressedInRemoteCache uploads decompressed layer to remote cache for cluster sharing.
