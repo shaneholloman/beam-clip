@@ -273,23 +273,25 @@ func StoreS3(storeS3Opts StoreS3Options) error {
 
 // CreateFromOCIImageOptions configures OCI image indexing
 type CreateFromOCIImageOptions struct {
-	ImageRef        string      // Source image to index (can be local)
-	StorageImageRef string      // Optional: image reference to store in metadata (defaults to ImageRef)
-	OutputPath      string      // Path for the metadata-only .clip archive
-	CheckpointMiB   int64       // Gzip checkpoint interval
-	CredProvider    interface{} // Optional registry credential provider
-	ProgressChan    chan<- OCIIndexProgress
-	Platform        *v1.Platform
-	ContentCache    storage.ContentCache // Optional cache to warm with decompressed layer streams
-	ContentCacheDir string               // Optional temp directory for layer cache upload spooling
+	ImageRef         string      // Source image to index (can be local)
+	StorageImageRef  string      // Optional: image reference to store in metadata (defaults to ImageRef)
+	OutputPath       string      // Path for the metadata-only .clip archive
+	CheckpointMiB    int64       // Gzip checkpoint interval
+	CredProvider     interface{} // Optional registry credential provider
+	ProgressChan     chan<- OCIIndexProgress
+	Platform         *v1.Platform
+	ContentCache     storage.ContentCache    // Optional cache to warm with decompressed layer streams
+	ContentCacheDir  string                  // Optional temp directory for layer cache upload spooling
+	LayerIndexCache  storage.LayerIndexCache // Optional per-layer index artifact cache (skips pull+index on hit)
+	IndexConcurrency int                     // Max layers indexed concurrently (default 4)
 }
 
 // CreateFromOCIImage creates a metadata-only index (.clip) file from an OCI image
 func CreateFromOCIImage(ctx context.Context, options CreateFromOCIImageOptions) error {
 	if options.StorageImageRef != "" && options.StorageImageRef != options.ImageRef {
-		log.Info().Msgf("creating OCI archive index: indexing from %s, storing reference to %s", options.ImageRef, options.StorageImageRef)
+		log.Debug().Msgf("creating OCI archive index: indexing from %s, storing reference to %s", options.ImageRef, options.StorageImageRef)
 	} else {
-		log.Info().Msgf("creating OCI archive index from %s to %s", options.ImageRef, options.OutputPath)
+		log.Debug().Msgf("creating OCI archive index from %s to %s", options.ImageRef, options.OutputPath)
 	}
 
 	if options.CheckpointMiB == 0 {
@@ -306,28 +308,30 @@ func CreateFromOCIImage(ctx context.Context, options CreateFromOCIImageOptions) 
 
 	archiver := NewClipArchiver()
 	err := archiver.CreateFromOCI(ctx, IndexOCIImageOptions{
-		ImageRef:        options.ImageRef,
-		StorageImageRef: options.StorageImageRef,
-		CheckpointMiB:   options.CheckpointMiB,
-		CredProvider:    credProvider,
-		ProgressChan:    options.ProgressChan,
-		Platform:        options.Platform,
-		ContentCache:    options.ContentCache,
-		ContentCacheDir: options.ContentCacheDir,
+		ImageRef:         options.ImageRef,
+		StorageImageRef:  options.StorageImageRef,
+		CheckpointMiB:    options.CheckpointMiB,
+		CredProvider:     credProvider,
+		ProgressChan:     options.ProgressChan,
+		Platform:         options.Platform,
+		ContentCache:     options.ContentCache,
+		ContentCacheDir:  options.ContentCacheDir,
+		LayerIndexCache:  options.LayerIndexCache,
+		IndexConcurrency: options.IndexConcurrency,
 	}, options.OutputPath)
 
 	if err != nil {
 		return err
 	}
 
-	log.Info().Msg("OCI archive index created successfully")
+	log.Debug().Msg("OCI archive index created successfully")
 	return nil
 }
 
 // CreateAndUploadOCIArchive creates an OCI index and uploads metadata to S3
 // This combines indexing with remote storage upload
 func CreateAndUploadOCIArchive(ctx context.Context, options CreateFromOCIImageOptions, si common.ClipStorageInfo) error {
-	log.Info().Msgf("creating and uploading OCI archive index from %s", options.ImageRef)
+	log.Debug().Msgf("creating and uploading OCI archive index from %s", options.ImageRef)
 
 	// Create the OCI index locally
 	err := CreateFromOCIImage(ctx, options)
@@ -355,7 +359,7 @@ func CreateAndUploadOCIArchive(ctx context.Context, options CreateFromOCIImageOp
 			return fmt.Errorf("failed to create remote archive: %w", err)
 		}
 
-		log.Info().Msg("OCI archive index uploaded successfully")
+		log.Debug().Msg("OCI archive index uploaded successfully")
 	}
 
 	return nil

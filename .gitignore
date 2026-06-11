@@ -1,8 +1,9 @@
 bin/clip
 bin/e2e
+bin/harness
 tmp/*
 testfs/*
 *.gob
 *.clip
 *.rclip
-*.pprof
+*.pprofbin/clip-harness-stdgzip

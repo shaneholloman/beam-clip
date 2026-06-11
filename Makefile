@@ -13,3 +13,12 @@ stop:
 
 e2e:
 	go build -o ./bin/e2e ./e2e/main.go
+
+harness:
+	go build -o ./bin/harness ./cmd/harness
+
+verify: harness
+	./bin/harness verify
+
+bench: harness
+	./bin/harness bench
